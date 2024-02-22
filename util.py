@@ -1,12 +1,18 @@
 import os
 import pandas as pd
 
+from sklearn.compose import make_column_transformer, make_column_selector
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from numpy import number
+
 from sklearn import metrics
 from sklearn.base import clone
 
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, precision_score, recall_score, f1_score, fbeta_score
 from imblearn.metrics import geometric_mean_score
-from fairlearn.metrics import MetricFrame, demographic_parity_difference, equalized_odds_difference, selection_rate
+from fairlearn.metrics import MetricFrame, demographic_parity_difference, equalized_odds_difference, selection_rate, true_positive_rate, true_negative_rate, false_negative_rate
 from aif360.sklearn.metrics import equal_opportunity_difference, disparate_impact_ratio
 
 from pathlib import Path
@@ -47,10 +53,13 @@ def evaluate_model_fairness(Y_target, Y_pred, sensitive_features):
 
     #fairness metrics to be used
     metrics_dict = {
-        "selection_rate": selection_rate
+        "true_positive_rate" : true_positive_rate,
+        "balanced_accuracy" : balanced_accuracy_score,
+        "selection_rate" : selection_rate,
+        # "false_negative_rate" : false_negative_rate,        
     }
 
-    tree_mf = MetricFrame(
+    metric_frame = MetricFrame(
         metrics=metrics_dict,
         y_true=Y_target,
         y_pred=Y_pred,
@@ -58,7 +67,11 @@ def evaluate_model_fairness(Y_target, Y_pred, sensitive_features):
     )
 
     # The disaggregated metrics
-    print(tree_mf.by_group)
+    print(metric_frame.by_group)
+
+    metric_frame.by_group.plot.bar(
+        subplots=True, layout=[1, 4], figsize=[16, 4], legend=None, rot=-45, position=1
+    )
 
     dem_par_diff = demographic_parity_difference(
         y_true=Y_target,
@@ -91,12 +104,15 @@ def evaluate_model_fairness(Y_target, Y_pred, sensitive_features):
     print('The Equal opportunity difference score on the trained model:', eq_opp_diff)
     print('The Disparate impact ratio on the trained model:', disparate_impact_rat)
 
-    return [dem_par_diff, eq_odd_diff, eq_opp_diff, disparate_impact_rat]
+    return [dem_par_diff, eq_odd_diff, eq_opp_diff, disparate_impact_rat, metric_frame]
     
 def evaluate_train_data_fairness(X_train, Y_train, A_train):
-        #fairness metrics to be used
+        
+    #fairness metrics to be used
     metrics_dict = {
-        "selection_rate": selection_rate
+        "balanced_accuracy" : balanced_accuracy_score,
+        "true_positive_rate" : true_positive_rate,
+        "selection_rate" : selection_rate,
     }
 
     tree_mf = MetricFrame(
@@ -129,7 +145,7 @@ def evaluate_train_data_fairness(X_train, Y_train, A_train):
 
     return [dem_par_diff, disparate_impact_rat]
 
-def train_model_on_datasets(model):
+def train_model_on_datasets(model, type="scikit"):
 
     # load datasets
     data_path = Path(os.getcwd()).parent.parent / "data" / "dataset_diabetes" / "clsf_data"
@@ -195,9 +211,42 @@ def train_model_on_datasets(model):
         print()
         print(ref_i)
         model_copy = clone(model)
-        model_copy.fit(X_train_i, Y_train_i)
-        # Predicting on the test data
-        model_pred = model_copy.predict(X_test_i)
+        model_pred = None
+        if type=='scikit':
+            model_copy.fit(X_train_i, Y_train_i)
+            model_pred = model_copy.predict(X_test_i)
+            print(metrics.RocCurveDisplay.from_estimator(model_copy, X_test_i, Y_test))
+        elif type=='adversarial':
+            ct = make_column_transformer(
+                (
+                    Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="mean")),
+                            ("normalizer", StandardScaler()),
+                        ]
+                    ),
+                    make_column_selector(dtype_include=number),
+                ),
+                (
+                    Pipeline(
+                        [
+                            ("imputer", SimpleImputer(strategy="most_frequent")),
+                            ("encoder", OneHotEncoder(drop="if_binary", sparse=False)),
+                        ]
+                    ),
+                    make_column_selector(dtype_include="category"),
+                ),
+            )
+
+            X_prep_train_i = ct.fit_transform(X_train_i) # Only fit on training data!
+            X_prep_test_i = ct.transform(X_test_i)
+            model_copy.fit(X_prep_train_i, Y_train_i, sensitive_features=A_train_i)
+            model_pred = model_copy.predict(X_prep_test_i)
+        elif type=='postproc':
+            model_copy.fit(X_train_i, Y_train_i, sensitive_features=A_train_i)
+            model_pred = model_copy.predict(X_test_i, sensitive_features=A_test)
+        
+        # Predicting on the test data        
         train_data_fairness_results_i = evaluate_train_data_fairness(X_train_i, Y_train_i, A_train_i)
         performance_results_i = evaluate_model_performance(Y_test, model_pred)
         fairness_results_i = evaluate_model_fairness(Y_test, model_pred, A_test)
@@ -205,7 +254,5 @@ def train_model_on_datasets(model):
         train_data_fairness_results.append(train_data_fairness_results_i)
         performance_results.append(performance_results_i)
         fairness_results.append(fairness_results_i)
-
-        print(metrics.RocCurveDisplay.from_estimator(model_copy, X_test_i, Y_test))
 
     return train_data_fairness_results, performance_results, fairness_results
